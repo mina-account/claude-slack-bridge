@@ -261,14 +261,13 @@ curl -X POST http://localhost:3409/callback \
   -H "Content-Type: application/json" \
   -d '{
     "thread_ts": "1234567890.123456",
-    "text": "[From: Export Service] Export complete. Download URL: https://example.com/report.pdf — please relay this to the user."
+    "text": "[From: Export Service] Export complete. Download URL: https://example.com/report.pdf"
   }'
 ```
 
-> **Important:** The `text` in the callback payload is delivered to Claude exactly as if a human typed it in the Slack thread. This means:
-> - Claude will follow any instructions in the message (e.g. "relay this to the user", "summarize and notify", "ask the user if they want to proceed").
-> - Your app should identify itself in the message (e.g. `[From: My Service]`) so Claude understands the source and can communicate it clearly to the human.
-> - Without a clear instruction like "relay this to the user", Claude may respond to your app's message rather than surfacing it to the human.
+> **Important:** The daemon automatically prefixes all callback messages with `[CALLBACK]` before passing them to Claude. At session start, Claude is told that `[CALLBACK]` messages are trusted system notifications — so it will present the content to the human rather than flagging it as a prompt injection attempt.
+>
+> Your app should still identify itself in the message (e.g. `[From: My Service]`) so Claude can communicate the source clearly to the human. You do **not** need to include instructions like "relay this to the user" — Claude handles that automatically.
 
 **Responses:**
 

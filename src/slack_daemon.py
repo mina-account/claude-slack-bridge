@@ -195,8 +195,9 @@ class SlackDaemon:
         if thread_ts in self._active_threads:
             return web.Response(status=409, text="Thread is currently busy processing another message.")
 
-        logger.info("HTTP callback for thread %s: %r", thread_ts, text)
-        asyncio.create_task(self._handle_claude_thread_reply(channel, thread_ts, text))
+        prefixed_text = f"[CALLBACK] {text}"
+        logger.info("HTTP callback for thread %s: %r", thread_ts, prefixed_text)
+        asyncio.create_task(self._handle_claude_thread_reply(channel, thread_ts, prefixed_text))
         return web.Response(status=202, text="Accepted.")
 
     async def start(self) -> None:
