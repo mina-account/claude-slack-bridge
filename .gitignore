@@ -2,3 +2,7 @@
 .env
 .claude/
 projects.json
+
+.venv/
+__pycache__/
+.vscode/

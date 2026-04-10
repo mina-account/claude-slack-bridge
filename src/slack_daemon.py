@@ -14,10 +14,13 @@ the Claude Code CLI, and the response is posted back as a thread reply.
 """
 
 import asyncio
+import json
 import logging
 import os
+import socket
 from typing import Any
 
+from aiohttp import web
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 from slack_bolt.async_app import AsyncApp
 
@@ -40,7 +43,7 @@ class SlackDaemon:
         app_token: Slack app-level token for Socket Mode (xapp-...).
     """
 
-    def __init__(self, bot_token: str, app_token: str) -> None:
+    def __init__(self, bot_token: str, app_token: str, http_port: int = 3409) -> None:
         self._app = AsyncApp(token=bot_token)
         self._handler = AsyncSocketModeHandler(self._app, app_token)
         self._pending: dict[str, asyncio.StreamWriter] = {}
@@ -48,6 +51,7 @@ class SlackDaemon:
         self._claude = ClaudeHandler(slack_client=self._app.client)
         self._active_threads: set[str] = set()
         self._bot_user_id: str = ""
+        self._http_port = http_port
 
         self._app.event("message")(self._handle_slack_message)
 
@@ -164,21 +168,65 @@ class SlackDaemon:
             if not writer.is_closing():
                 writer.close()
 
+    async def _handle_http_callback(self, request: web.Request) -> web.Response:
+        """
+        POST /callback — external app notifies Claude with a result for an existing thread.
+
+        Expected JSON body:
+            { "thread_ts": "<slack thread timestamp>", "text": "<message to pass to Claude>" }
+
+        Claude will respond in the same Slack thread.
+        """
+        try:
+            body = await request.json()
+        except Exception:
+            return web.Response(status=400, text="Invalid JSON body.")
+
+        thread_ts = body.get("thread_ts")
+        text = body.get("text")
+
+        if not thread_ts or not text:
+            return web.Response(status=400, text="Missing required fields: thread_ts, text.")
+
+        channel = self._claude.get_channel_for_thread(thread_ts)
+        if not channel:
+            return web.Response(status=404, text=f"Unknown thread_ts: {thread_ts}. Session may have expired or never existed.")
+
+        if thread_ts in self._active_threads:
+            return web.Response(status=409, text="Thread is currently busy processing another message.")
+
+        logger.info("HTTP callback for thread %s: %r", thread_ts, text)
+        asyncio.create_task(self._handle_claude_thread_reply(channel, thread_ts, text))
+        return web.Response(status=202, text="Accepted.")
+
     async def start(self) -> None:
-        """Start the Unix socket server and Slack Socket Mode handler concurrently."""
+        """Start the Unix socket server, HTTP callback server, and Slack Socket Mode handler."""
         await self._claude.initialize()
         self._bot_user_id = self._claude._bot_user_id
 
         if os.path.exists(SOCKET_PATH):
             os.unlink(SOCKET_PATH)
 
-        server = await asyncio.start_unix_server(
+        unix_server = await asyncio.start_unix_server(
             self._handle_session_connection, path=SOCKET_PATH
         )
         logger.info("Unix socket server listening at %s.", SOCKET_PATH)
 
-        async with server:
+        http_app = web.Application()
+        http_app.router.add_post("/callback", self._handle_http_callback)
+        runner = web.AppRunner(http_app)
+        await runner.setup()
+        site = web.TCPSite(runner, "0.0.0.0", self._http_port)
+        await site.start()
+
+        hostname = socket.gethostname()
+        local_ip = socket.gethostbyname(hostname)
+        callback_url = f"http://{local_ip}:{self._http_port}/callback"
+        logger.info("HTTP callback endpoint: %s", callback_url)
+        print(f"\n  Callback endpoint: POST {callback_url}\n")
+
+        async with unix_server:
             await asyncio.gather(
-                server.serve_forever(),
+                unix_server.serve_forever(),
                 self._handler.start_async(),
             )

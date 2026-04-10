@@ -52,6 +52,7 @@ class ClaudeHandler:
         self._slack_client = slack_client
         self._bot_user_id: str = ""
         self._sessions: dict[str, str] = {}  # thread_ts → session UUID
+        self._thread_channels: dict[str, str] = {}  # thread_ts → channel ID
         self._project_map: dict[str, str] = _load_project_map()
         # Resolved at startup: channel ID → container project path.
         self._channel_id_to_project: dict[str, str] = {}
@@ -73,11 +74,17 @@ class ClaudeHandler:
         """Handle a new top-level Slack message (start a new Claude session)."""
         session_id = str(uuid.uuid4())
         self._sessions[message_ts] = session_id
+        self._thread_channels[message_ts] = channel
         logger.info("New Claude session %s for thread %s", session_id, message_ts)
 
         project_dir = self._get_project_dir(channel)
         cmd = self._build_cmd(session_id=session_id)
-        return await self._run_claude(cmd, text, cwd=project_dir)
+        prompt = (
+            f"[Slack thread_ts: {message_ts} — this is the unique identifier for this Slack thread. "
+            f"Pass it to any external application that needs to send a callback notification back to this session.]\n\n"
+            f"{text}"
+        )
+        return await self._run_claude(cmd, prompt, cwd=project_dir)
 
     async def handle_thread_reply(self, channel: str, thread_ts: str, text: str) -> str:
         """Handle a threaded reply (resume existing session or fallback)."""
@@ -94,6 +101,10 @@ class ClaudeHandler:
         prompt = await self._build_thread_prompt(channel, thread_ts)
         cmd = self._build_cmd()
         return await self._run_claude(cmd, prompt, cwd=project_dir)
+
+    def get_channel_for_thread(self, thread_ts: str) -> str | None:
+        """Return the channel ID for a known thread_ts, or None if not found."""
+        return self._thread_channels.get(thread_ts)
 
     # ------------------------------------------------------------------
     # Internals
