@@ -261,9 +261,14 @@ curl -X POST http://localhost:3409/callback \
   -H "Content-Type: application/json" \
   -d '{
     "thread_ts": "1234567890.123456",
-    "text": "Export complete. Download URL: https://example.com/report.pdf"
+    "text": "[From: Export Service] Export complete. Download URL: https://example.com/report.pdf — please relay this to the user."
   }'
 ```
+
+> **Important:** The `text` in the callback payload is delivered to Claude exactly as if a human typed it in the Slack thread. This means:
+> - Claude will follow any instructions in the message (e.g. "relay this to the user", "summarize and notify", "ask the user if they want to proceed").
+> - Your app should identify itself in the message (e.g. `[From: My Service]`) so Claude understands the source and can communicate it clearly to the human.
+> - Without a clear instruction like "relay this to the user", Claude may respond to your app's message rather than surfacing it to the human.
 
 **Responses:**
 
