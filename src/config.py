@@ -24,6 +24,6 @@ class Config(BaseSettings):
     timeout_limit_minutes: int = 5
     projects_dir: str = ""
     http_port: int = 3409
-    db_path: str = "/data/sessions.db"
+    db_path: str = "sessions.db"
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
