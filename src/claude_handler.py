@@ -75,7 +75,7 @@ class ClaudeHandler:
     async def handle_message(self, channel: str, message_ts: str, text: str) -> str:
         """Handle a new top-level Slack message (start a new Claude session)."""
         session_id = str(uuid.uuid4())
-        self._store.upsert(message_ts, channel, session_id)
+        await asyncio.to_thread(self._store.upsert, message_ts, channel, session_id)
         logger.info("New Claude session %s for thread %s", session_id, message_ts)
 
         project_dir = self._get_project_dir(channel)
@@ -98,7 +98,7 @@ class ClaudeHandler:
         # retains callback capability in the recovered session.
         logger.info("No session for thread %s, recovering from thread history.", thread_ts)
         new_session_id = str(uuid.uuid4())
-        self._store.upsert(thread_ts, channel, new_session_id)
+        await asyncio.to_thread(self._store.upsert, thread_ts, channel, new_session_id)
         history = await self._build_thread_history(channel, thread_ts)
         prompt = self._build_thread_preamble(thread_ts) + history
         cmd = self._build_cmd(session_id=new_session_id)

@@ -25,5 +25,8 @@ class Config(BaseSettings):
     projects_dir: str = ""
     http_port: int = 3409
     db_path: str = "sessions.db"
+    # When set, POST /callback requires "Authorization: Bearer <value>".
+    # Leave empty to disable auth (trusted-network / local-only deployments).
+    callback_secret: str = ""
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
