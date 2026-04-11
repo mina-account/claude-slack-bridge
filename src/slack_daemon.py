@@ -25,6 +25,7 @@ from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 from slack_bolt.async_app import AsyncApp
 
 from claude_handler import ClaudeHandler
+from session_store import SessionStore
 
 logger = logging.getLogger(__name__)
 
@@ -43,12 +44,12 @@ class SlackDaemon:
         app_token: Slack app-level token for Socket Mode (xapp-...).
     """
 
-    def __init__(self, bot_token: str, app_token: str, http_port: int = 3409) -> None:
+    def __init__(self, bot_token: str, app_token: str, http_port: int = 3409, store: SessionStore | None = None) -> None:
         self._app = AsyncApp(token=bot_token)
         self._handler = AsyncSocketModeHandler(self._app, app_token)
         self._pending: dict[str, asyncio.StreamWriter] = {}
         self._lock = asyncio.Lock()
-        self._claude = ClaudeHandler(slack_client=self._app.client)
+        self._claude = ClaudeHandler(slack_client=self._app.client, store=store or SessionStore(":memory:"))
         self._active_threads: set[str] = set()
         self._bot_user_id: str = ""
         self._http_port = http_port

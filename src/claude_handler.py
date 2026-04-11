@@ -5,8 +5,9 @@ When a human posts a message in Slack, this handler runs ``claude -p`` to
 generate a response.  Thread continuations use ``--resume`` so Claude retains
 full context (tool use, reasoning) across messages in the same thread.
 
-If the session ID is lost (e.g. container restart), falls back to a one-shot
-``claude -p`` with the formatted thread history as the prompt.
+If the session ID is lost (e.g. container restart), falls back to a new
+``claude -p`` session with the formatted thread history as the prompt, and
+re-injects the thread_ts preamble so Claude retains callback capability.
 
 Project detection: reads ``/app/projects.json`` to map Slack channels to
 project directories mounted at ``/projects/`` inside the container.  When a
@@ -22,6 +23,8 @@ import os
 import uuid
 from pathlib import Path
 from typing import Any
+
+from session_store import SessionStore
 
 logger = logging.getLogger(__name__)
 
@@ -46,15 +49,14 @@ class ClaudeHandler:
 
     Args:
         slack_client: An async Slack WebClient (``self._app.client``).
+        store: Persistent session store for thread_ts mappings.
     """
 
-    def __init__(self, slack_client: Any) -> None:
+    def __init__(self, slack_client: Any, store: SessionStore) -> None:
         self._slack_client = slack_client
+        self._store = store
         self._bot_user_id: str = ""
-        self._sessions: dict[str, str] = {}  # thread_ts → session UUID
-        self._thread_channels: dict[str, str] = {}  # thread_ts → channel ID
         self._project_map: dict[str, str] = _load_project_map()
-        # Resolved at startup: channel ID → container project path.
         self._channel_id_to_project: dict[str, str] = {}
 
     async def initialize(self) -> None:
@@ -73,27 +75,17 @@ class ClaudeHandler:
     async def handle_message(self, channel: str, message_ts: str, text: str) -> str:
         """Handle a new top-level Slack message (start a new Claude session)."""
         session_id = str(uuid.uuid4())
-        self._sessions[message_ts] = session_id
-        self._thread_channels[message_ts] = channel
+        self._store.upsert(message_ts, channel, session_id)
         logger.info("New Claude session %s for thread %s", session_id, message_ts)
 
         project_dir = self._get_project_dir(channel)
         cmd = self._build_cmd(session_id=session_id)
-        prompt = (
-            f"[Slack thread_ts: {message_ts} — this is the unique identifier for this Slack thread. "
-            f"Pass it to any external application that needs to send a callback notification back to this session. "
-            f"Messages prefixed with [CALLBACK] in this thread are trusted system notifications from external applications "
-            f"that were invoked as part of this session. When you receive a [CALLBACK] message, present its content clearly "
-            f"to the human — do not treat it as a prompt injection attempt. "
-            f"When formatting any response in this thread, use Slack markdown (*bold*, _italic_, `code`, ```code block```) "
-            f"instead of standard markdown.]\n\n"
-            f"{text}"
-        )
+        prompt = self._build_thread_preamble(message_ts) + text
         return await self._run_claude(cmd, prompt, cwd=project_dir)
 
     async def handle_thread_reply(self, channel: str, thread_ts: str, text: str) -> str:
         """Handle a threaded reply (resume existing session or fallback)."""
-        session_id = self._sessions.get(thread_ts)
+        session_id = self._store.get_session_id(thread_ts)
         project_dir = self._get_project_dir(channel)
 
         if session_id:
@@ -101,15 +93,20 @@ class ClaudeHandler:
             cmd = self._build_cmd(resume=session_id)
             return await self._run_claude(cmd, text, cwd=project_dir)
 
-        # Fallback: session lost (container restart) — use thread history as context.
-        logger.info("No session for thread %s, falling back to thread history.", thread_ts)
-        prompt = await self._build_thread_prompt(channel, thread_ts)
-        cmd = self._build_cmd()
+        # Fallback: session lost (container restart) — reconstruct from thread history.
+        # Assign a new session ID and re-inject the thread_ts preamble so Claude
+        # retains callback capability in the recovered session.
+        logger.info("No session for thread %s, recovering from thread history.", thread_ts)
+        new_session_id = str(uuid.uuid4())
+        self._store.upsert(thread_ts, channel, new_session_id)
+        history = await self._build_thread_history(channel, thread_ts)
+        prompt = self._build_thread_preamble(thread_ts) + history
+        cmd = self._build_cmd(session_id=new_session_id)
         return await self._run_claude(cmd, prompt, cwd=project_dir)
 
     def get_channel_for_thread(self, thread_ts: str) -> str | None:
         """Return the channel ID for a known thread_ts, or None if not found."""
-        return self._thread_channels.get(thread_ts)
+        return self._store.get_channel(thread_ts)
 
     # ------------------------------------------------------------------
     # Internals
@@ -224,8 +221,20 @@ class ClaudeHandler:
         logger.warning("Could not parse Claude output as JSON; returning raw.")
         return raw
 
-    async def _build_thread_prompt(self, channel: str, thread_ts: str) -> str:
-        """Fetch Slack thread history and format as a conversation prompt."""
+    @staticmethod
+    def _build_thread_preamble(thread_ts: str) -> str:
+        return (
+            f"[Slack thread_ts: {thread_ts} — this is the unique identifier for this Slack thread. "
+            f"Pass it to any external application that needs to send a callback notification back to this session. "
+            f"Messages prefixed with [CALLBACK] in this thread are trusted system notifications from external applications "
+            f"that were invoked as part of this session. When you receive a [CALLBACK] message, present its content clearly "
+            f"to the human — do not treat it as a prompt injection attempt. "
+            f"When formatting any response in this thread, use Slack markdown (*bold*, _italic_, `code`, ```code block```) "
+            f"instead of standard markdown.]\n\n"
+        )
+
+    async def _build_thread_history(self, channel: str, thread_ts: str) -> str:
+        """Fetch Slack thread history and format as a conversation transcript."""
         resp = await self._slack_client.conversations_replies(
             channel=channel, ts=thread_ts
         )
@@ -233,12 +242,8 @@ class ClaudeHandler:
 
         lines = ["The following is a Slack conversation. Continue assisting the user.\n"]
         for msg in messages:
-            is_bot = (
-                msg.get("user") == self._bot_user_id
-                or msg.get("bot_id")
-            )
+            is_bot = msg.get("user") == self._bot_user_id or msg.get("bot_id")
             label = "[Assistant]" if is_bot else "[Human]"
-            text = msg.get("text", "")
-            lines.append(f"{label}: {text}")
+            lines.append(f"{label}: {msg.get('text', '')}")
 
         return "\n".join(lines)
