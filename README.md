@@ -57,16 +57,38 @@ This means `SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN` live only in `.env` (set once
 
 Follow [docs/slack-setup.md](docs/slack-setup.md) to create a Slack app, get your `xoxb-` and `xapp-` tokens, and invite the bot to a channel.
 
-### 2. Clone, configure, and start the daemon
+### 2. Clone and configure
 
 ```bash
 git clone https://github.com/your-username/claude-slack-bridge.git
 cd claude-slack-bridge
 cp .env.example .env   # fill in SLACK_BOT_TOKEN and SLACK_APP_TOKEN
+```
+
+### 3. Start the daemon
+
+**Option A — Docker (recommended)**
+
+```bash
 docker compose up -d --build
 ```
 
 The container starts automatically on system boot (`restart: unless-stopped`) and uses Socket Mode — no public URL or inbound firewall rules needed.
+
+**Option B — Native (no Docker)**
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+cd src && python3 main.py
+```
+
+The daemon prints the HTTP callback URL to stdout on startup:
+
+```
+  Callback endpoint: POST http://<your-ip>:3409/callback
+```
 
 **You only do this once.** The daemon stays running in the background and serves all your Claude Code projects.
 
@@ -115,11 +137,12 @@ That's it. Open the project in Claude Code and Claude will have access to `ask_o
 
 ### `.env` (daemon — set once, shared across all projects)
 
-| Variable | Required | Description |
-|---|---|---|
-| `SLACK_BOT_TOKEN` | Yes | Bot OAuth token (`xoxb-...`) |
-| `SLACK_APP_TOKEN` | Yes | Socket Mode app token (`xapp-...`) |
-| `PROJECTS_DIR` | Yes | Absolute path to the parent directory containing all your projects |
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `SLACK_BOT_TOKEN` | Yes | — | Bot OAuth token (`xoxb-...`) |
+| `SLACK_APP_TOKEN` | Yes | — | Socket Mode app token (`xapp-...`) |
+| `PROJECTS_DIR` | No | — | Absolute path to the parent directory containing all your projects |
+| `HTTP_PORT` | No | `3409` | Port for the HTTP callback server |
 
 ### `.mcp.json` (per project — set per Claude Code project)
 
@@ -196,6 +219,66 @@ docker compose up -d --build
 #### Adding new projects
 
 Just add a line to `projects.json` and rebuild. No changes to `docker-compose.yml` needed.
+
+---
+
+## HTTP Callback Endpoint
+
+The daemon exposes a lightweight HTTP server so external applications can notify Claude mid-session and have it respond back in the same Slack thread.
+
+### How it works
+
+1. A human pings `@claude-bot` in Slack — Claude receives the `thread_ts` in its prompt and knows to pass it to any external app it calls.
+2. The external app does its work asynchronously.
+3. When done, the app POSTs to `/callback` with the `thread_ts` and a result message.
+4. The daemon routes the message into the existing Claude session, which replies in the original Slack thread.
+
+```
+Human @Claude  ──▶  Claude runs, passes thread_ts to external app
+                              External app does work
+                              POST /callback { thread_ts, text }
+                    Daemon routes into session  ──▶  Claude replies in thread
+```
+
+### Endpoint
+
+```
+POST http://<host>:<HTTP_PORT>/callback
+Content-Type: application/json
+```
+
+**Request body:**
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `thread_ts` | string | Yes | The Slack thread timestamp Claude passed to your app |
+| `text` | string | Yes | The message to deliver to Claude in that thread |
+
+**Example:**
+
+```bash
+curl -X POST http://localhost:3409/callback \
+  -H "Content-Type: application/json" \
+  -d '{
+    "thread_ts": "1234567890.123456",
+    "text": "[From: Export Service] Export complete. Download URL: https://example.com/report.pdf"
+  }'
+```
+
+> **Important:** The daemon automatically prefixes all callback messages with `[CALLBACK]` before passing them to Claude. At session start, Claude is told that `[CALLBACK]` messages are trusted system notifications — so it will present the content to the human rather than flagging it as a prompt injection attempt.
+>
+> Your app should still identify itself in the message (e.g. `[From: My Service]`) so Claude can communicate the source clearly to the human. You do **not** need to include instructions like "relay this to the user" — Claude handles that automatically.
+
+**Responses:**
+
+| Status | Meaning |
+|---|---|
+| `202 Accepted` | Message queued — Claude will respond in the thread shortly |
+| `400 Bad Request` | Missing or malformed JSON body (`thread_ts` or `text` not provided) |
+| `404 Not Found` | Unknown `thread_ts` — session never existed or daemon was restarted |
+| `409 Conflict` | Thread is currently busy processing another message |
+
+> **Note:** The callback URL (including host and port) is printed to stdout each time the daemon starts.
 
 ---
 

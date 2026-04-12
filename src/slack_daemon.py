@@ -16,17 +16,23 @@ the Claude Code CLI, and the response is posted back as a thread reply.
 import asyncio
 import logging
 import os
+import re
+import socket
 from typing import Any
 
+from aiohttp import web
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 from slack_bolt.async_app import AsyncApp
 
 from claude_handler import ClaudeHandler
+from session_store import SessionStore
 
 logger = logging.getLogger(__name__)
 
 SOCKET_PATH = "/tmp/slack-bridge.sock"
 SLACK_MAX_MESSAGE_LENGTH = 40000
+CALLBACK_MAX_TEXT_LEN = 10_000
+_THREAD_TS_RE = re.compile(r"^\d+\.\d{6}$")
 
 
 class SlackDaemon:
@@ -40,14 +46,16 @@ class SlackDaemon:
         app_token: Slack app-level token for Socket Mode (xapp-...).
     """
 
-    def __init__(self, bot_token: str, app_token: str) -> None:
+    def __init__(self, bot_token: str, app_token: str, http_port: int = 3409, store: SessionStore | None = None, callback_secret: str = "") -> None:
         self._app = AsyncApp(token=bot_token)
         self._handler = AsyncSocketModeHandler(self._app, app_token)
         self._pending: dict[str, asyncio.StreamWriter] = {}
         self._lock = asyncio.Lock()
-        self._claude = ClaudeHandler(slack_client=self._app.client)
+        self._claude = ClaudeHandler(slack_client=self._app.client, store=store or SessionStore(":memory:"))
         self._active_threads: set[str] = set()
         self._bot_user_id: str = ""
+        self._http_port = http_port
+        self._callback_secret = callback_secret
 
         self._app.event("message")(self._handle_slack_message)
 
@@ -164,21 +172,89 @@ class SlackDaemon:
             if not writer.is_closing():
                 writer.close()
 
+    async def _handle_http_callback(self, request: web.Request) -> web.Response:
+        """
+        POST /callback — external app notifies Claude with a result for an existing thread.
+
+        Expected JSON body:
+            { "thread_ts": "<slack thread timestamp>", "text": "<message to pass to Claude>" }
+
+        If CALLBACK_SECRET is configured, the request must include:
+            Authorization: Bearer <secret>
+
+        Claude will respond in the same Slack thread.
+        """
+        if self._callback_secret:
+            auth = request.headers.get("Authorization", "")
+            if auth != f"Bearer {self._callback_secret}":
+                return web.json_response({"error": "Unauthorized."}, status=401)
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "Invalid JSON body."}, status=400)
+
+        thread_ts = body.get("thread_ts")
+        text = body.get("text")
+
+        if not thread_ts or not text:
+            return web.json_response({"error": "Missing required fields: thread_ts, text."}, status=400)
+
+        if not _THREAD_TS_RE.match(thread_ts):
+            return web.json_response({"error": "Invalid thread_ts format."}, status=400)
+
+        if len(text) > CALLBACK_MAX_TEXT_LEN:
+            return web.json_response(
+                {"error": f"text exceeds maximum length of {CALLBACK_MAX_TEXT_LEN} characters."},
+                status=400,
+            )
+
+        channel = self._claude.get_channel_for_thread(thread_ts)
+        if not channel:
+            return web.json_response({"error": f"Unknown thread_ts: {thread_ts}. Session may have expired or never existed."}, status=404)
+
+        if thread_ts in self._active_threads:
+            return web.json_response({"error": "Thread is currently busy processing another message."}, status=409)
+
+        # Add to active_threads before create_task so concurrent callbacks for the
+        # same thread_ts are rejected even before the task has a chance to run.
+        self._active_threads.add(thread_ts)
+        prefixed_text = f"[CALLBACK] {text}"
+        logger.info("HTTP callback for thread %s: %r", thread_ts, prefixed_text)
+        asyncio.create_task(self._handle_claude_thread_reply(channel, thread_ts, prefixed_text))
+        return web.json_response({"status": "accepted"}, status=202)
+
     async def start(self) -> None:
-        """Start the Unix socket server and Slack Socket Mode handler concurrently."""
+        """Start the Unix socket server, HTTP callback server, and Slack Socket Mode handler."""
         await self._claude.initialize()
         self._bot_user_id = self._claude._bot_user_id
 
         if os.path.exists(SOCKET_PATH):
             os.unlink(SOCKET_PATH)
 
-        server = await asyncio.start_unix_server(
+        unix_server = await asyncio.start_unix_server(
             self._handle_session_connection, path=SOCKET_PATH
         )
         logger.info("Unix socket server listening at %s.", SOCKET_PATH)
 
-        async with server:
+        http_app = web.Application()
+        http_app.router.add_post("/callback", self._handle_http_callback)
+        runner = web.AppRunner(http_app)
+        await runner.setup()
+        site = web.TCPSite(runner, "0.0.0.0", self._http_port)
+        await site.start()
+
+        hostname = socket.gethostname()
+        try:
+            local_ip = socket.gethostbyname(hostname)
+        except socket.gaierror:
+            local_ip = "localhost"
+        callback_url = f"http://{local_ip}:{self._http_port}/callback"
+        logger.info("HTTP callback endpoint: %s", callback_url)
+        print(f"\n  Callback endpoint: POST {callback_url}\n")
+
+        async with unix_server:
             await asyncio.gather(
-                server.serve_forever(),
+                unix_server.serve_forever(),
                 self._handler.start_async(),
             )
